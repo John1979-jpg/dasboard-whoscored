@@ -6,12 +6,14 @@ import matplotlib.patches as patches
 from io import BytesIO
 from mplsoccer import Pitch
 import matplotlib.patheffects as path_effects
+from highlight_text import ax_text
 from unidecode import unidecode
 import warnings
 warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="Zona del Analista", page_icon="⚽", layout="wide")
 violet = '#a369ff'
+green = '#32CD32'
 
 def extract_json_from_html(html_content):
     regex_pattern = r'(?<=require\.config\.params\["args"\].=.)[\s\S]*?;'
@@ -45,6 +47,11 @@ def process_dataframe(df, teams_dict):
     df['y'] = pd.to_numeric(df['y'], errors='coerce') * 0.68
     df['endX'] = pd.to_numeric(df.get('endX'), errors='coerce') * 1.05 if 'endX' in df.columns else np.nan
     df['endY'] = pd.to_numeric(df.get('endY'), errors='coerce') * 0.68 if 'endY' in df.columns else np.nan
+    # goalMouthY y goalMouthZ para el gráfico de portería
+    if 'goalMouthY' in df.columns:
+        df['goalMouthY'] = pd.to_numeric(df['goalMouthY'], errors='coerce') * 0.68
+    if 'goalMouthZ' in df.columns:
+        df['goalMouthZ'] = pd.to_numeric(df['goalMouthZ'], errors='coerce')
     if 'qualifiers' in df.columns: df['qualifiers'] = df['qualifiers'].astype(str)
     df['prog_pass'] = np.where((df['type'] == 'Pass'), np.sqrt((105-df['x'])**2+(34-df['y'])**2)-np.sqrt((105-df['endX'])**2+(34-df['endY'])**2), 0)
     df['prog_carry'] = np.where((df['type'] == 'Carry'), np.sqrt((105-df['x'])**2+(34-df['y'])**2)-np.sqrt((105-df['endX'])**2+(34-df['endY'])**2), 0)
@@ -52,6 +59,8 @@ def process_dataframe(df, teams_dict):
     df['second'] = pd.to_numeric(df['second'], errors='coerce').fillna(0)
     df['cumulative_mins'] = df['minute'] + df['second']/60
     df['pass_or_carry_angle'] = np.degrees(np.arctan2(df['endY']-df['y'], df['endX']-df['x']))
+    # isTouch para plot_congestion
+    df['isTouch'] = df['type'].isin(['Pass', 'Carry', 'TakeOn', 'MissedShots', 'SavedShot', 'Goal', 'ShotOnPost', 'BallTouch', 'Aerial'])
     return df
 
 def insert_ball_carries(events_df):
@@ -65,6 +74,7 @@ def insert_ball_carries(events_df):
             carries.append({'minute':ev['minute'],'second':ev['second'],'teamId':nxt['teamId'],'teamName':nxt['teamName'],
                 'x':ev['endX'],'y':ev['endY'],'endX':nxt['x'],'endY':nxt['y'],'type':'Carry','outcomeType':'Successful',
                 'period':nxt['period'],'playerId':nxt.get('playerId'),'name':nxt.get('name'),'position':nxt.get('position'),
+                'qualifiers':'[]','isTouch':True,
                 'cumulative_mins':(ev['cumulative_mins']+nxt['cumulative_mins'])/2,
                 'prog_carry':np.sqrt((105-ev['endX'])**2+(34-ev['endY'])**2)-np.sqrt((105-nxt['x'])**2+(34-nxt['y'])**2)})
     return pd.concat([pd.DataFrame(carries), match_events]).sort_values(['period','cumulative_mins']).reset_index(drop=True)
@@ -98,14 +108,14 @@ def get_defensive_action_df(df):
     return df.loc[ids, ["x","y","teamName","playerId","type","outcomeType"]]
 
 def get_da_count_df(team_name, da_df, players_df):
-    da_df = da_df[da_df["teamName"]==team_name].merge(players_df[["playerId","isFirstEleven"]], on='playerId', how='left')
-    avg = da_df.groupby('playerId').agg({'x':['median'],'y':['median','count']})
+    da = da_df[da_df["teamName"]==team_name].merge(players_df[["playerId","isFirstEleven"]], on='playerId', how='left')
+    avg = da.groupby('playerId').agg({'x':['median'],'y':['median','count']})
     avg.columns = ['x','y','count']
-    return avg.merge(players_df[['playerId','name','shirtNo','position','isFirstEleven']], on='playerId', how='left').set_index('playerId')
+    avg = avg.merge(players_df[['playerId','name','shirtNo','position','isFirstEleven']], on='playerId', how='left').set_index('playerId')
+    return avg
 
 def create_progressor_df(df, team_name):
-    team_df = df[df['teamName']==team_name]
-    players = team_df['name'].dropna().unique()
+    players = df[df['teamName']==team_name]['name'].dropna().unique()
     data = {'name':[],'Progressive Passes':[],'Progressive Carries':[],'LineBreaking Pass':[]}
     for n in players:
         data['name'].append(n)
@@ -119,8 +129,7 @@ def create_progressor_df(df, team_name):
     return pf
 
 def create_defender_df(df, team_name):
-    team_df = df[df['teamName']==team_name]
-    players = team_df['name'].dropna().unique()
+    players = df[df['teamName']==team_name]['name'].dropna().unique()
     data = {'name':[],'Tackles':[],'Interceptions':[],'Clearance':[]}
     for n in players:
         data['name'].append(n)
@@ -134,8 +143,7 @@ def create_defender_df(df, team_name):
     return df2
 
 def create_shot_sequence_df(df, team_name):
-    team_df = df[df['teamName']==team_name]
-    players = team_df['name'].dropna().unique()
+    players = df[df['teamName']==team_name]['name'].dropna().unique()
     df_nc = df[df['type']!='Carry']
     data = {'name':[],'Shots':[],'Shot Assist':[],'Buildup to shot':[]}
     for n in players:
@@ -149,111 +157,165 @@ def create_shot_sequence_df(df, team_name):
     df2['shortName'] = df2['name'].apply(get_short_name)
     return df2
 
-# === VISUALIZACIONES DASHBOARD 1 ===
-def pass_network_visualization(ax, passes_between_df, avg_locs, col, teamName, hteamName, bg_color, line_color, passes_df):
-    passes_between_df = passes_between_df.copy()
-    passes_between_df['width'] = passes_between_df.pass_count/passes_between_df.pass_count.max()*15
-    color = np.tile(np.array(to_rgba(col)), (len(passes_between_df),1))
-    color[:,3] = (passes_between_df.pass_count/passes_between_df.pass_count.max()*0.8)+0.1
+# === DASHBOARD 1 VISUALIZATIONS ===
+def pass_network_visualization(ax, passes_between, avg_locs, col, team_name, hteamName, bg_color, line_color, passes_df):
+    passes_between = passes_between.copy()
+    passes_between['width'] = passes_between.pass_count/passes_between.pass_count.max()*15
+    color = np.tile(np.array(to_rgba(col)), (len(passes_between),1))
+    color[:,3] = (passes_between.pass_count/passes_between.pass_count.max()*0.8)+0.1
     pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, line_color=line_color, linewidth=2)
     pitch.draw(ax=ax); ax.set_xlim(-0.5,105.5)
-    pitch.lines(passes_between_df.pass_avg_x, passes_between_df.pass_avg_y, passes_between_df.pass_avg_x_end, passes_between_df.pass_avg_y_end, lw=passes_between_df.width, color=color, zorder=1, ax=ax)
+    pitch.lines(passes_between.pass_avg_x, passes_between.pass_avg_y, passes_between.pass_avg_x_end, passes_between.pass_avg_y_end, 
+                lw=passes_between.width, color=color, zorder=1, ax=ax)
     for _,row in avg_locs.iterrows():
         m = 'o' if row.get('isFirstEleven',True) else 's'
-        pitch.scatter(row['pass_avg_x'],row['pass_avg_y'],s=1000,marker=m,color=bg_color,edgecolor=line_color,linewidth=2,ax=ax)
+        pitch.scatter(row['pass_avg_x'],row['pass_avg_y'],s=1000,marker=m,color=bg_color,edgecolor=line_color,linewidth=2,ax=ax,zorder=2)
         pitch.annotate(str(int(row["shirtNo"])) if pd.notna(row.get("shirtNo")) else '',xy=(row.pass_avg_x,row.pass_avg_y),c=col,ha='center',va='center',size=18,ax=ax)
     avgph = round(avg_locs['pass_avg_x'].median(),2)
     ax.axvline(x=avgph, color='gray', linestyle='--', alpha=0.75, linewidth=2)
-    cbs = avg_locs[avg_locs['position']=='DC']
+    cbs = avg_locs[avg_locs['position']=='DC'] if 'position' in avg_locs.columns else avg_locs
     def_h = round(cbs['pass_avg_x'].median(),2) if not cbs.empty else avgph
-    fwds = avg_locs[avg_locs['isFirstEleven']==1].nlargest(2,'pass_avg_x')
+    fwds = avg_locs[avg_locs['isFirstEleven']==1].nlargest(2,'pass_avg_x') if 'isFirstEleven' in avg_locs.columns else avg_locs.nlargest(2,'pass_avg_x')
     fwd_h = round(fwds['pass_avg_x'].mean(),2) if not fwds.empty else avgph
     ax.fill([def_h,fwd_h,fwd_h,def_h],[0,0,68,68],col,alpha=0.1)
-    tp = passes_df[passes_df["teamName"]==teamName].copy()
+    tp = passes_df[passes_df["teamName"]==team_name].copy()
     tp['pass_or_carry_angle'] = tp['pass_or_carry_angle'].abs()
     tp = tp[(tp['pass_or_carry_angle']>=0)&(tp['pass_or_carry_angle']<=90)]
     vert = round((1-tp['pass_or_carry_angle'].median()/90)*100,2) if not tp.empty else 0
-    if teamName!=hteamName:
+    if team_name!=hteamName:
         ax.invert_xaxis(); ax.invert_yaxis()
         ax.text(avgph-1,73,f"{avgph}m",fontsize=15,color=line_color,ha='left')
         ax.text(105,73,f"verticalidad: {vert}%",fontsize=15,color=line_color,ha='left')
         ax.text(2,2,"circulo = Titulares\ncuadro= suplentes",color=col,size=12,ha='right',va='top')
-        ax.set_title(f"{teamName}\nRed de pases",color=line_color,size=25,fontweight='bold')
     else:
         ax.text(avgph-1,-5,f"{avgph}m",fontsize=15,color=line_color,ha='right')
         ax.text(105,-5,f"verticalidad: {vert}%",fontsize=15,color=line_color,ha='right')
         ax.text(2,66,"circulo = Titulares\ncuadro= suplentes",color=col,size=12,ha='left',va='top')
-        ax.set_title(f"{teamName}\nRed de Pases",color=line_color,size=25,fontweight='bold')
+    ax.set_title(f"{team_name}\nRed de Pases",color=line_color,size=25,fontweight='bold')
 
 def plot_shotmap(ax, df, hteamName, ateamName, hcol, acol, bg_color, line_color):
+    Shotsdf = df[df['type'].isin(['Goal','MissedShots','SavedShot','ShotOnPost'])].copy()
     pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, linewidth=2, line_color=line_color)
     pitch.draw(ax=ax); ax.set_ylim(-0.5,68.5); ax.set_xlim(-0.5,105.5)
-    shots = df[df['type'].isin(['Goal','MissedShots','SavedShot','ShotOnPost'])]
     for team,col,flip in [(hteamName,hcol,True),(ateamName,acol,False)]:
-        s = shots[shots['teamName']==team]
-        g,p,sv,m = s[s['type']=='Goal'],s[s['type']=='ShotOnPost'],s[s['type']=='SavedShot'],s[s['type']=='MissedShots']
+        s = Shotsdf[Shotsdf['teamName']==team]
+        g = s[s['type']=='Goal']; p = s[s['type']=='ShotOnPost']; sv = s[s['type']=='SavedShot']; m = s[s['type']=='MissedShots']
         if flip:
-            pitch.scatter(105-g.x,68-g.y,s=350,edgecolors='white',c='None',marker='football',zorder=3,ax=ax)
-            pitch.scatter(105-p.x,68-p.y,s=200,edgecolors=col,c=col,marker='o',ax=ax)
-            pitch.scatter(105-sv.x,68-sv.y,s=200,edgecolors=col,c='None',hatch='///////',marker='o',ax=ax)
-            pitch.scatter(105-m.x,68-m.y,s=200,edgecolors=col,c='None',marker='o',ax=ax)
+            if not g.empty: pitch.scatter(105-g.x,68-g.y,s=350,edgecolors='white',c='None',marker='football',zorder=3,ax=ax)
+            if not p.empty: pitch.scatter(105-p.x,68-p.y,s=200,edgecolors=col,c=col,marker='o',ax=ax)
+            if not sv.empty: pitch.scatter(105-sv.x,68-sv.y,s=200,edgecolors=col,c='None',hatch='///////',marker='o',ax=ax)
+            if not m.empty: pitch.scatter(105-m.x,68-m.y,s=200,edgecolors=col,c='None',marker='o',ax=ax)
         else:
-            pitch.scatter(g.x,g.y,s=350,edgecolors='white',c='None',marker='football',zorder=3,ax=ax)
-            pitch.scatter(p.x,p.y,s=200,edgecolors=col,c=col,marker='o',ax=ax)
-            pitch.scatter(sv.x,sv.y,s=200,edgecolors=col,c='None',hatch='///////',marker='o',ax=ax)
-            pitch.scatter(m.x,m.y,s=200,edgecolors=col,c='None',marker='o',ax=ax)
+            if not g.empty: pitch.scatter(g.x,g.y,s=350,edgecolors='white',c='None',marker='football',zorder=3,ax=ax)
+            if not p.empty: pitch.scatter(p.x,p.y,s=200,edgecolors=col,c=col,marker='o',ax=ax)
+            if not sv.empty: pitch.scatter(sv.x,sv.y,s=200,edgecolors=col,c='None',hatch='///////',marker='o',ax=ax)
+            if not m.empty: pitch.scatter(m.x,m.y,s=200,edgecolors=col,c='None',marker='o',ax=ax)
     ax.text(0,70,f"{hteamName}\n<---Tiros",color=hcol,size=25,ha='left',fontweight='bold')
     ax.text(105,70,f"{ateamName}\nTiros--->",color=acol,size=25,ha='right',fontweight='bold')
 
 def defensive_block(ax, avg_locs, da_df, team_name, col, hteamName, bg_color, line_color):
     da_team = da_df[da_df["teamName"]==team_name]
-    pitch = Pitch(pitch_type='uefa', pitch_color=bg_color, line_color=line_color, linewidth=2, corner_arcs=True)
+    # CORREGIDO: line_zorder=2 para que las líneas estén ENCIMA del heatmap
+    pitch = Pitch(pitch_type='uefa', pitch_color=bg_color, line_color=line_color, linewidth=2, line_zorder=2, corner_arcs=True)
     pitch.draw(ax=ax); ax.set_facecolor(bg_color); ax.set_xlim(-0.5,105.5)
+    if avg_locs.empty:
+        ax.set_title(f"{team_name}\nBloque Defensivo",color=line_color,fontsize=25,fontweight='bold')
+        return
     avg_locs = avg_locs.copy()
     avg_locs['marker_size'] = avg_locs['count']/avg_locs['count'].max()*3500
     cm = LinearSegmentedColormap.from_list("c",[bg_color,col],N=500)
+    # El kdeplot sin zorder especificado (usa default ~1) estará debajo de las líneas
     if len(da_team)>2:
         try: pitch.kdeplot(da_team.x,da_team.y,ax=ax,fill=True,levels=5000,thresh=0.02,cut=4,cmap=cm)
         except: pass
+    # Scatter con zorder=3 para estar encima de todo
     for _,row in avg_locs.iterrows():
         m = 'o' if row.get('isFirstEleven',True) else 's'
         pitch.scatter(row['x'],row['y'],s=row['marker_size']+100,marker=m,color=bg_color,edgecolor=line_color,linewidth=1,zorder=3,ax=ax)
         pitch.annotate(str(int(row["shirtNo"])) if pd.notna(row.get("shirtNo")) else '',xy=(row.x,row.y),c=line_color,ha='center',va='center',size=14,ax=ax)
+    # Tiny scatterings para acciones defensivas
+    pitch.scatter(da_team.x,da_team.y,s=10,marker='x',color='yellow',alpha=0.2,ax=ax)
     dah = round(avg_locs['x'].mean(),2)
+    dah_show = round(dah*1.05,2)
     ax.axvline(x=dah,color='gray',linestyle='--',alpha=0.75,linewidth=2)
-    cbs = avg_locs[avg_locs['position']=='DC']
+    cbs = avg_locs[avg_locs['position']=='DC'] if 'position' in avg_locs.columns else avg_locs
     def_h = round(cbs['x'].median(),2) if not cbs.empty else dah
-    fwds = avg_locs[avg_locs['isFirstEleven']==1].nlargest(2,'x')
+    ax.axvline(x=def_h,color='gray',linestyle='dotted',alpha=0.5,linewidth=2)
+    fwds = avg_locs[avg_locs['isFirstEleven']==1].nlargest(2,'x') if 'isFirstEleven' in avg_locs.columns else avg_locs.nlargest(2,'x')
     fwd_h = round(fwds['x'].mean(),2) if not fwds.empty else dah
+    ax.axvline(x=fwd_h,color='gray',linestyle='dotted',alpha=0.5,linewidth=2)
     comp = round((1-((fwd_h-def_h)/105))*100,2) if fwd_h!=def_h else 0
     if team_name!=hteamName:
         ax.invert_xaxis(); ax.invert_yaxis()
-        ax.text(dah-1,73,f"{dah}m",fontsize=15,color=line_color,ha='left')
+        ax.text(dah-1,73,f"{dah_show}m",fontsize=15,color=line_color,ha='left')
         ax.text(105,73,f'Defensa Compacta: {comp}%',fontsize=15,color=line_color,ha='left')
         ax.text(2,2,"círculo = titular\ncuadro = suplente",color='gray',size=12,ha='right',va='top')
-        ax.set_title(f"{team_name}\nBloque Defensivo",color=line_color,fontsize=25,fontweight='bold')
     else:
-        ax.text(dah-1,-5,f"{dah}m",fontsize=15,color=line_color,ha='right')
+        ax.text(dah-1,-5,f"{dah_show}m",fontsize=15,color=line_color,ha='right')
         ax.text(105,-5,f'Defensa Compacta: {comp}%',fontsize=15,color=line_color,ha='right')
         ax.text(2,66,"círculo = titular\ncuadro = suplente",color='gray',size=12,ha='left',va='top')
-        ax.set_title(f"{team_name}\nBloque Defensivo",color=line_color,fontsize=25,fontweight='bold')
+    ax.set_title(f"{team_name}\nBloque Defensivo",color=line_color,fontsize=25,fontweight='bold')
 
 def plot_goalPost(ax, df, hteamName, ateamName, hcol, acol, bg_color, line_color):
+    Shotsdf = df[df['type'].isin(['Goal','MissedShots','SavedShot','ShotOnPost'])].copy()
+    hShotsdf = Shotsdf[Shotsdf['teamName']==hteamName].copy()
+    aShotsdf = Shotsdf[Shotsdf['teamName']==ateamName].copy()
+    
+    # Transformar coordenadas para la portería
+    if 'goalMouthZ' in hShotsdf.columns and 'goalMouthY' in hShotsdf.columns:
+        hShotsdf['goalMouthZ_plot'] = hShotsdf['goalMouthZ']*0.75
+        aShotsdf['goalMouthZ_plot'] = (aShotsdf['goalMouthZ']*0.75) + 38
+        hShotsdf['goalMouthY_plot'] = ((37.66 - hShotsdf['goalMouthY']/0.68)*12.295) + 7.5
+        aShotsdf['goalMouthY_plot'] = ((37.66 - aShotsdf['goalMouthY']/0.68)*12.295) + 7.5
+    
     pitch = Pitch(pitch_type='uefa', pitch_color=bg_color, line_color=bg_color, linewidth=2)
     pitch.draw(ax=ax); ax.set_ylim(-0.5,68.5); ax.set_xlim(-0.5,105.5)
-    for y in [7.5,97.5]: ax.plot([y,y],[0,30],color=line_color,linewidth=5)
+    
+    # Portería de abajo (away recibe tiros de home)
+    ax.plot([7.5,7.5],[0,30],color=line_color,linewidth=5)
     ax.plot([7.5,97.5],[30,30],color=line_color,linewidth=5)
+    ax.plot([97.5,97.5],[30,0],color=line_color,linewidth=5)
     ax.plot([0,105],[0,0],color=line_color,linewidth=3)
-    for y in [7.5,97.5]: ax.plot([y,y],[38,68],color=line_color,linewidth=5)
+    for y in np.arange(0,6)*6: ax.plot([7.5,97.5],[y,y],color=line_color,linewidth=2,alpha=0.2)
+    for x in (np.arange(0,11)*9)+7.5: ax.plot([x,x],[0,30],color=line_color,linewidth=2,alpha=0.2)
+    
+    # Portería de arriba (home recibe tiros de away)
+    ax.plot([7.5,7.5],[38,68],color=line_color,linewidth=5)
     ax.plot([7.5,97.5],[68,68],color=line_color,linewidth=5)
+    ax.plot([97.5,97.5],[68,38],color=line_color,linewidth=5)
     ax.plot([0,105],[38,38],color=line_color,linewidth=3)
-    shots = df[df['type'].isin(['Goal','MissedShots','SavedShot','ShotOnPost'])]
-    hs = len(shots[(shots['teamName']==hteamName)&(shots['type']=='SavedShot')])
-    avs = len(shots[(shots['teamName']==ateamName)&(shots['type']=='SavedShot')])
+    for y in (np.arange(0,6)*6)+38: ax.plot([7.5,97.5],[y,y],color=line_color,linewidth=2,alpha=0.2)
+    for x in (np.arange(0,11)*9)+7.5: ax.plot([x,x],[38,68],color=line_color,linewidth=2,alpha=0.2)
+    
+    # Plotear tiros en portería
+    if 'goalMouthY_plot' in hShotsdf.columns:
+        # Home shots (van a portería de abajo - away GK saves)
+        hSave = hShotsdf[(hShotsdf['type']=='SavedShot')&(~hShotsdf['qualifiers'].str.contains(': 82,',na=False))]
+        hGoal = hShotsdf[(hShotsdf['type']=='Goal')&(~hShotsdf['qualifiers'].str.contains('OwnGoal',na=False))]
+        hPost = hShotsdf[hShotsdf['type']=='ShotOnPost']
+        # Away shots (van a portería de arriba - home GK saves)
+        aSave = aShotsdf[(aShotsdf['type']=='SavedShot')&(~aShotsdf['qualifiers'].str.contains(': 82,',na=False))]
+        aGoal = aShotsdf[(aShotsdf['type']=='Goal')&(~aShotsdf['qualifiers'].str.contains('OwnGoal',na=False))]
+        aPost = aShotsdf[aShotsdf['type']=='ShotOnPost']
+        
+        # Scatters
+        if not hSave.empty: pitch.scatter(hSave.goalMouthY_plot,hSave.goalMouthZ_plot,marker='o',c=bg_color,zorder=3,edgecolor=acol,hatch='/////',s=350,ax=ax)
+        if not hGoal.empty: pitch.scatter(hGoal.goalMouthY_plot,hGoal.goalMouthZ_plot,marker='football',c=bg_color,zorder=3,edgecolors='white',s=350,ax=ax)
+        if not hPost.empty: pitch.scatter(hPost.goalMouthY_plot,hPost.goalMouthZ_plot,marker='o',c=bg_color,zorder=3,edgecolors='orange',hatch='/////',s=350,ax=ax)
+        if not aSave.empty: pitch.scatter(aSave.goalMouthY_plot,aSave.goalMouthZ_plot,marker='o',c=bg_color,zorder=3,edgecolor=hcol,hatch='/////',s=350,ax=ax)
+        if not aGoal.empty: pitch.scatter(aGoal.goalMouthY_plot,aGoal.goalMouthZ_plot,marker='football',c=bg_color,zorder=3,edgecolors='white',s=350,ax=ax)
+        if not aPost.empty: pitch.scatter(aPost.goalMouthY_plot,aPost.goalMouthZ_plot,marker='o',c=bg_color,zorder=3,edgecolors='orange',hatch='/////',s=350,ax=ax)
+        
+        hSaves = len(hSave)
+        aSaves = len(aSave)
+    else:
+        hSaves = len(hShotsdf[hShotsdf['type']=='SavedShot'])
+        aSaves = len(aShotsdf[aShotsdf['type']=='SavedShot'])
+    
     ax.text(52.5,70,f"{hteamName} PT Paradas",color=hcol,fontsize=25,ha='center',fontweight='bold')
     ax.text(52.5,-2,f"{ateamName} PT Paradas",color=acol,fontsize=25,ha='center',va='top',fontweight='bold')
-    ax.text(100,68,f"Paradas = {avs}",color=hcol,fontsize=14,va='top',ha='left')
-    ax.text(100,2,f"Paradas = {hs}",color=acol,fontsize=14,va='bottom',ha='left')
+    ax.text(100,68,f"Paradas = {aSaves}",color=hcol,fontsize=14,va='top',ha='left')
+    ax.text(100,2,f"Paradas = {hSaves}",color=acol,fontsize=14,va='bottom',ha='left')
 
 def draw_progressive_pass_map(ax, df, team_name, col, hteamName, bg_color, line_color):
     dfpro = df[(df['teamName']==team_name)&(df['prog_pass']>=9.11)&(~df['qualifiers'].str.contains('CornerTaken|Freekick',na=False))&(df['x']>=35)&(df['outcomeType']=='Successful')]
@@ -262,11 +324,11 @@ def draw_progressive_pass_map(ax, df, team_name, col, hteamName, bg_color, line_
     if team_name!=hteamName: ax.invert_xaxis(); ax.invert_yaxis()
     pc = len(dfpro)
     if pc==0: ax.set_title(f"{team_name}\n0 Pases Progresivos",color=line_color,fontsize=25,fontweight='bold'); return
-    l,m,r = len(dfpro[dfpro['y']>=45.33]),len(dfpro[(dfpro['y']>=22.67)&(dfpro['y']<45.33)]),len(dfpro[dfpro['y']<22.67])
+    l = len(dfpro[dfpro['y']>=45.33]); mid = len(dfpro[(dfpro['y']>=22.67)&(dfpro['y']<45.33)]); r = len(dfpro[dfpro['y']<22.67])
     ax.hlines([22.67,45.33],0,105,colors=line_color,linestyle='dashed',alpha=0.35)
     bb = dict(boxstyle="round,pad=0.3",edgecolor="None",facecolor=bg_color,alpha=0.75)
     ax.text(8,11.335,f'{r}\n({round(r/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
-    ax.text(8,34,f'{m}\n({round(m/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
+    ax.text(8,34,f'{mid}\n({round(mid/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
     ax.text(8,56.675,f'{l}\n({round(l/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
     pitch.lines(dfpro.x,dfpro.y,dfpro.endX,dfpro.endY,lw=3.5,comet=True,color=col,ax=ax,alpha=0.5)
     pitch.scatter(dfpro.endX,dfpro.endY,s=35,edgecolor=col,linewidth=1,color=bg_color,zorder=2,ax=ax)
@@ -279,11 +341,11 @@ def draw_progressive_carry_map(ax, df, team_name, col, hteamName, bg_color, line
     if team_name!=hteamName: ax.invert_xaxis(); ax.invert_yaxis()
     pc = len(dfpro)
     if pc==0: ax.set_title(f"{team_name}\n0 Avance Progresivo con Balón",color=line_color,fontsize=25,fontweight='bold'); return
-    l,m,r = len(dfpro[dfpro['y']>=45.33]),len(dfpro[(dfpro['y']>=22.67)&(dfpro['y']<45.33)]),len(dfpro[dfpro['y']<22.67])
+    l = len(dfpro[dfpro['y']>=45.33]); mid = len(dfpro[(dfpro['y']>=22.67)&(dfpro['y']<45.33)]); r = len(dfpro[dfpro['y']<22.67])
     ax.hlines([22.67,45.33],0,105,colors=line_color,linestyle='dashed',alpha=0.35)
     bb = dict(boxstyle="round,pad=0.3",edgecolor="None",facecolor=bg_color,alpha=0.75)
     ax.text(8,11.335,f'{r}\n({round(r/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
-    ax.text(8,34,f'{m}\n({round(m/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
+    ax.text(8,34,f'{mid}\n({round(mid/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
     ax.text(8,56.675,f'{l}\n({round(l/pc*100)}%)',color=col,fontsize=24,va='center',ha='center',bbox=bb)
     for _,row in dfpro.iterrows():
         if pd.notna(row['x']) and pd.notna(row['endX']):
@@ -295,8 +357,7 @@ def plotting_match_stats(ax, df, hteamName, ateamName, hcol, acol, bg_color, lin
     for s in ax.spines.values(): s.set_visible(False)
     ax.tick_params(axis='both',which='both',bottom=False,top=False,left=False,right=False,labelbottom=False,labelleft=False)
     def gs(team):
-        t = df[df['teamName']==team]
-        p = t[t['type']=='Pass']; a = p[p['outcomeType']=='Successful']
+        t = df[df['teamName']==team]; p = t[t['type']=='Pass']; a = p[p['outcomeType']=='Successful']
         lb = p[p['qualifiers'].str.contains('Longball',na=False)]; lba = lb[lb['outcomeType']=='Successful']
         co = p[p['qualifiers'].str.contains('CornerTaken',na=False)]
         tk = t[t['type']=='Tackle']; tkw = tk[tk['outcomeType']=='Successful']
@@ -317,7 +378,7 @@ def plotting_match_stats(ax, df, hteamName, ateamName, hcol, acol, bg_color, lin
         ax.text(5,y,h,color=line_color,fontsize=17,ha='left',va='center',fontweight='bold')
         ax.text(100,y,a,color=line_color,fontsize=17,ha='right',va='center',fontweight='bold')
 
-# === VISUALIZACIONES DASHBOARD 2 ===
+# === DASHBOARD 2 VISUALIZATIONS ===
 def Final_third_entry(ax, df, team_name, col, hteamName, bg_color, line_color):
     dfpass = df[(df['teamName']==team_name)&(df['type']=='Pass')&(df['x']<70)&(df['endX']>=70)&(df['outcomeType']=='Successful')&(~df['qualifiers'].str.contains('Freekick',na=False))]
     dfcarry = df[(df['teamName']==team_name)&(df['type']=='Carry')&(df['x']<70)&(df['endX']>=70)]
@@ -345,16 +406,21 @@ def box_entry(ax, df, hteamName, ateamName, hcol, acol, bg_color, line_color):
     pitch = Pitch(pitch_type='uefa', pitch_color=bg_color, line_color=line_color, linewidth=2, corner_arcs=True)
     pitch.draw(ax=ax); ax.set_xlim(-0.5,105.5)
     def ge(team):
-        p = df[(df['teamName']==team)&(df['type']=='Pass')&(df['outcomeType']=='Successful')&(df['x']<88.5)&(df['endX']>=88.5)&(df['endY']>=13.85)&(df['endY']<=54.15)]
-        c = df[(df['teamName']==team)&(df['type']=='Carry')&(df['x']<88.5)&(df['endX']>=88.5)&(df['endY']>=13.85)&(df['endY']<=54.15)]
-        lp = len(p[p['y']>=34])+len(c[c['y']>=34]); rp = len(p[p['y']<34])+len(c[c['y']<34])
-        return len(p)+len(c),lp,rp
+        bentry = df[((df['type']=='Pass')|(df['type']=='Carry'))&(df['teamName']==team)&(df['outcomeType']=='Successful')&(df['endX']>=88.5)&
+                    ~((df['x']>=88.5)&(df['y']>=13.6)&(df['y']<=54.6))&(df['endY']>=13.6)&(df['endY']<=54.4)&
+                    (~df['qualifiers'].str.contains('CornerTaken|Freekick|ThrowIn',na=False))]
+        l = len(bentry[bentry['y']>=34]); r = len(bentry[bentry['y']<34])
+        return len(bentry),l,r
     ht,hl,hr = ge(hteamName); at,al,ar = ge(ateamName)
-    bb = lambda c: dict(boxstyle="round,pad=0.5",facecolor=bg_color,edgecolor=c,linewidth=2)
-    ax.text(30,50,f"{hl}",color=hcol,fontsize=30,ha='center',va='center',fontweight='bold',bbox=bb(hcol))
-    ax.text(30,18,f"{hr}",color=hcol,fontsize=30,ha='center',va='center',fontweight='bold',bbox=bb(hcol))
-    ax.text(75,50,f"{al}",color=acol,fontsize=30,ha='center',va='center',fontweight='bold',bbox=bb(acol))
-    ax.text(75,18,f"{ar}",color=acol,fontsize=30,ha='center',va='center',fontweight='bold',bbox=bb(acol))
+    # Hexágonos para mostrar números
+    ax.scatter(30,50,color=hcol,s=3500,edgecolor=line_color,linewidth=2,marker='h',zorder=3)
+    ax.scatter(30,18,color=hcol,s=3500,edgecolor=line_color,linewidth=2,marker='h',zorder=3)
+    ax.scatter(75,50,color=acol,s=3500,edgecolor=line_color,linewidth=2,marker='h',zorder=3)
+    ax.scatter(75,18,color=acol,s=3500,edgecolor=line_color,linewidth=2,marker='h',zorder=3)
+    ax.text(30,50,f"{hl}",color=line_color,fontsize=30,ha='center',va='center',fontweight='bold')
+    ax.text(30,18,f"{hr}",color=line_color,fontsize=30,ha='center',va='center',fontweight='bold')
+    ax.text(75,50,f"{al}",color=line_color,fontsize=30,ha='center',va='center',fontweight='bold')
+    ax.text(75,18,f"{ar}",color=line_color,fontsize=30,ha='center',va='center',fontweight='bold')
     ax.set_title(f"{hteamName}\nEntradas al área: {ht}",color=hcol,fontsize=20,fontweight='bold',loc='left')
     ax.set_title(f"{ateamName}\nEntradas al área: {at}",color=acol,fontsize=20,fontweight='bold',loc='right')
 
@@ -376,10 +442,11 @@ def zone14hs(ax, df, team_name, col, hteamName, bg_color, line_color):
     ax.fill([70,88.54,88.54,70],[22.66,22.66,45.32,45.32],'#38dacc',alpha=0.2)
     ax.fill([70,105,105,70],[11.33,11.33,22.66,22.66],col,alpha=0.2)
     ax.fill([70,105,105,70],[45.32,45.32,56.95,56.95],col,alpha=0.2)
+    # Hexágonos
     ax.scatter(16.46,13.85,color=col,s=10000,edgecolor=line_color,linewidth=2,marker='h')
     ax.scatter(16.46,54.15,color='#38dacc',s=10000,edgecolor=line_color,linewidth=2,marker='h')
-    ax.text(16.46,13.85-3.5,"Carril int",fontsize=16,color=line_color,ha='center')
-    ax.text(16.46,54.15-3.5,"Zona14",fontsize=16,color=line_color,ha='center')
+    ax.text(16.46,13.85-4,"Carril int",fontsize=14,color=line_color,ha='center')
+    ax.text(16.46,54.15-4,"Zona14",fontsize=14,color=line_color,ha='center')
     ax.text(16.46,13.85+2,str(hs),fontsize=35,color=line_color,ha='center',va='center',fontweight='bold')
     ax.text(16.46,54.15+2,str(z14),fontsize=35,color=line_color,ha='center',va='center',fontweight='bold')
     ax.set_title(f"{team_name}\nPase Zona 14 y carril interior",color=line_color,fontsize=25,fontweight='bold')
@@ -427,7 +494,72 @@ def HighTO(ax, df, hteamName, ateamName, hcol, acol, bg_color, line_color):
     ax.set_title(f"{hteamName}\nPérdidas zona alta: {hto}",color=hcol,fontsize=18,fontweight='bold',loc='left')
     ax.set_title(f"{ateamName}\nPérdidas zona alta: {ato}",color=acol,fontsize=18,fontweight='bold',loc='right')
 
-# === VISUALIZACIONES DASHBOARD 3 ===
+def Chance_creating_zone(ax, df, team_name, col, hteamName, bg_color, line_color):
+    """Zona de creación de oportunidades - KeyPass heatmap"""
+    ccp = df[(df['qualifiers'].str.contains('KeyPass',na=False))&(df['teamName']==team_name)]
+    pitch = Pitch(pitch_type='uefa', line_color=line_color, corner_arcs=True, line_zorder=2, pitch_color=bg_color, linewidth=2)
+    pitch.draw(ax=ax); ax.set_xlim(-0.5,105.5)
+    if team_name!=hteamName: ax.invert_xaxis(); ax.invert_yaxis()
+    cc = 0
+    cm = LinearSegmentedColormap.from_list("c",[bg_color,col],N=20)
+    if not ccp.empty:
+        bs = pitch.bin_statistic(ccp.x,ccp.y,bins=(6,5),statistic='count',normalize=False)
+        pitch.heatmap(bs,ax=ax,cmap=cm,edgecolors='#f8f8f8')
+        pe = [path_effects.Stroke(linewidth=3,foreground=bg_color),path_effects.Normal()]
+        pitch.label_heatmap(bs,color=line_color,fontsize=25,ax=ax,ha='center',va='center',str_format='{:.0f}',path_effects=pe)
+    for _,row in ccp.iterrows():
+        if 'IntentionalGoalAssist' in str(row['qualifiers']):
+            pitch.lines(row['x'],row['y'],row['endX'],row['endY'],color=green,comet=True,lw=3,zorder=3,ax=ax)
+            ax.scatter(row['endX'],row['endY'],s=35,linewidth=1,color=bg_color,edgecolor=green,zorder=4)
+        else:
+            pitch.lines(row['x'],row['y'],row['endX'],row['endY'],color=violet,comet=True,lw=3,zorder=3,ax=ax)
+            ax.scatter(row['endX'],row['endY'],s=35,linewidth=1,color=bg_color,edgecolor=violet,zorder=4)
+        cc += 1
+    if team_name==hteamName:
+        ax.text(105,-3.5,"Morado = Pase clave\nVerde = Asistencia",color=col,size=12,ha='right')
+        ax.text(52.5,70,f"Total Oportunidades creadas = {cc}",color=col,fontsize=15,ha='center')
+    else:
+        ax.text(105,71.5,"Morado = Pase clave\nVerde = Asistencia",color=col,size=12,ha='left')
+        ax.text(52.5,-2,f"Total Oportunidades creadas = {cc}",color=col,fontsize=15,ha='center')
+    ax.set_title(f"{team_name}\nZona Oportunidades creadas",color=line_color,fontsize=25,fontweight='bold')
+
+def plot_congestion(ax, df, hteamName, ateamName, hcol, acol, bg_color, line_color):
+    """Zona de dominio del equipo basada en toques"""
+    pcmap = LinearSegmentedColormap.from_list("c",[acol,'gray',hcol],N=20)
+    df1 = df[(df['teamName']==hteamName)&(df['isTouch']==True)&(~df['qualifiers'].str.contains('CornerTaken|Freekick|ThrowIn',na=False))].copy()
+    df2 = df[(df['teamName']==ateamName)&(df['isTouch']==True)&(~df['qualifiers'].str.contains('CornerTaken|Freekick|ThrowIn',na=False))].copy()
+    df2['x'] = 105-df2['x']; df2['y'] = 68-df2['y']
+    pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, line_color=line_color, linewidth=2, line_zorder=6)
+    pitch.draw(ax=ax); ax.set_ylim(-0.5,68.5); ax.set_xlim(-0.5,105.5)
+    if df1.empty or df2.empty:
+        ax.set_title("Zona de dominio equipo",color=line_color,fontsize=30,fontweight='bold',y=1.075)
+        return
+    bs1 = pitch.bin_statistic(df1.x,df1.y,bins=(6,5),statistic='count',normalize=False)
+    bs2 = pitch.bin_statistic(df2.x,df2.y,bins=(6,5),statistic='count',normalize=False)
+    cx = np.array([[8.75,26.25,43.75,61.25,78.75,96.25]]*5)
+    cy = np.array([[61.2]*6,[47.6]*6,[34.0]*6,[20.4]*6,[6.8]*6])
+    df_cong = pd.DataFrame({'cx':cx.flatten(),'cy':cy.flatten()})
+    hd_values = []
+    for i in range(bs1['statistic'].shape[0]):
+        for j in range(bs1['statistic'].shape[1]):
+            s1,s2 = bs1['statistic'][i,j],bs2['statistic'][i,j]
+            total = s1+s2
+            if total==0: hd_values.append(0.5)
+            elif (s1/total)>0.55: hd_values.append(1)
+            elif (s1/total)<0.45: hd_values.append(0)
+            else: hd_values.append(0.5)
+    df_cong['hd'] = hd_values
+    bs = pitch.bin_statistic(df_cong.cx,df_cong.cy,bins=(6,5),values=df_cong['hd'],statistic='sum',normalize=False)
+    pitch.heatmap(bs,ax=ax,cmap=pcmap,edgecolors='#000000',lw=0,zorder=3,alpha=0.85)
+    try: ax_text(52.5,71,s=f"<{hteamName}>  |  Disputado  |  <{ateamName}>",highlight_textprops=[{'color':hcol},{'color':acol}],color='gray',fontsize=18,ha='center',va='center',ax=ax)
+    except: ax.text(52.5,71,f"{hteamName} | Disputado | {ateamName}",color='gray',fontsize=18,ha='center')
+    ax.set_title("Zona de dominio equipo",color=line_color,fontsize=30,fontweight='bold',y=1.075)
+    ax.text(0,-3,'Direccion Ataque--->',color=hcol,fontsize=13,ha='left')
+    ax.text(105,-3,'<---Direccion Ataque',color=acol,fontsize=13,ha='right')
+    for v in [1,2,3,4,5]: ax.vlines(v*(105/6),ymin=0,ymax=68,color=bg_color,lw=2,ls='--',zorder=5)
+    for h in [1,2,3,4]: ax.hlines(h*(68/5),xmin=0,xmax=105,color=bg_color,lw=2,ls='--',zorder=5)
+
+# === DASHBOARD 3 VISUALIZATIONS ===
 def home_player_passmap(ax, df, prog_df, col, bg_color, line_color):
     pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, line_color=line_color, linewidth=2)
     pitch.draw(ax=ax); ax.set_xlim(-0.5,105.5); ax.set_ylim(-0.5,68.5)
@@ -435,7 +567,7 @@ def home_player_passmap(ax, df, prog_df, col, bg_color, line_color):
     name = prog_df['name'].iloc[0]
     acc = df[(df['name']==name)&(df['type']=='Pass')&(df['outcomeType']=='Successful')]
     pro = acc[(acc['prog_pass']>=9.11)&(acc['x']>=35)&(~acc['qualifiers'].str.contains('CornerTaken|Freekick',na=False))]
-    car = df[(df['name']==name)&(df['prog_carry']>=9.11)&(df['endX']>=35)]
+    car = df[(df['name']==name)&(df['type']=='Carry')&(df['prog_carry']>=9.11)&(df['endX']>=35)]
     key = acc[acc['qualifiers'].str.contains('KeyPass',na=False)]
     pitch.lines(acc.x,acc.y,acc.endX,acc.endY,color=line_color,lw=2,alpha=0.15,comet=True,zorder=2,ax=ax)
     pitch.lines(pro.x,pro.y,pro.endX,pro.endY,color=col,lw=3,alpha=1,comet=True,zorder=3,ax=ax)
@@ -457,7 +589,7 @@ def away_player_passmap(ax, df, prog_df, col, bg_color, line_color):
     name = prog_df['name'].iloc[0]
     acc = df[(df['name']==name)&(df['type']=='Pass')&(df['outcomeType']=='Successful')]
     pro = acc[(acc['prog_pass']>=9.11)&(acc['x']>=35)&(~acc['qualifiers'].str.contains('CornerTaken|Freekick',na=False))]
-    car = df[(df['name']==name)&(df['prog_carry']>=9.11)&(df['endX']>=35)]
+    car = df[(df['name']==name)&(df['type']=='Carry')&(df['prog_carry']>=9.11)&(df['endX']>=35)]
     key = acc[acc['qualifiers'].str.contains('KeyPass',na=False)]
     pitch.lines(acc.x,acc.y,acc.endX,acc.endY,color=line_color,lw=2,alpha=0.15,comet=True,zorder=2,ax=ax)
     pitch.lines(pro.x,pro.y,pro.endX,pro.endY,color=col,lw=3,alpha=1,comet=True,zorder=3,ax=ax)
@@ -474,11 +606,12 @@ def away_player_passmap(ax, df, prog_df, col, bg_color, line_color):
 def home_passes_received(ax, df, avg_locs, col, bg_color, line_color):
     pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, line_color=line_color, linewidth=2)
     pitch.draw(ax=ax); ax.set_xlim(-0.5,105.5); ax.set_ylim(-0.5,68.5)
-    fw = avg_locs[avg_locs['position']=='FW']
+    fw = avg_locs[avg_locs['position']=='FW'] if 'position' in avg_locs.columns else pd.DataFrame()
     if fw.empty: fw = avg_locs.nlargest(1,'pass_avg_x')
     if fw.empty: ax.set_title("Sin datos",color=col,fontsize=25,fontweight='bold'); return
     name = fw['name'].iloc[0]; sn = get_short_name(name)
-    filt = df[(df['type']=='Pass')&(df['outcomeType']=='Successful')&(df['name'].shift(-1)==name)]
+    filt = df[(df['type']=='Pass')&(df['outcomeType']=='Successful')]
+    filt = filt[filt['playerId'].shift(-1)==fw.index[0]] if not fw.empty else filt
     key = filt[filt['qualifiers'].str.contains('KeyPass',na=False)]
     pitch.lines(filt.x,filt.y,filt.endX,filt.endY,lw=3,comet=True,color=col,ax=ax,alpha=0.5)
     pitch.lines(key.x,key.y,key.endX,key.endY,lw=4,comet=True,color=violet,ax=ax,alpha=0.75)
@@ -490,11 +623,12 @@ def away_passes_received(ax, df, avg_locs, col, bg_color, line_color):
     pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, line_color=line_color, linewidth=2)
     pitch.draw(ax=ax); ax.set_xlim(-0.5,105.5); ax.set_ylim(-0.5,68.5)
     ax.invert_xaxis(); ax.invert_yaxis()
-    fw = avg_locs[avg_locs['position']=='FW']
+    fw = avg_locs[avg_locs['position']=='FW'] if 'position' in avg_locs.columns else pd.DataFrame()
     if fw.empty: fw = avg_locs.nlargest(1,'pass_avg_x')
     if fw.empty: ax.set_title("Sin datos",color=col,fontsize=25,fontweight='bold'); return
     name = fw['name'].iloc[0]; sn = get_short_name(name)
-    filt = df[(df['type']=='Pass')&(df['outcomeType']=='Successful')&(df['name'].shift(-1)==name)]
+    filt = df[(df['type']=='Pass')&(df['outcomeType']=='Successful')]
+    filt = filt[filt['playerId'].shift(-1)==fw.index[0]] if not fw.empty else filt
     key = filt[filt['qualifiers'].str.contains('KeyPass',na=False)]
     pitch.lines(filt.x,filt.y,filt.endX,filt.endY,lw=3,comet=True,color=col,ax=ax,alpha=0.5)
     pitch.lines(key.x,key.y,key.endX,key.endY,lw=4,comet=True,color=violet,ax=ax,alpha=0.75)
@@ -530,7 +664,7 @@ def away_player_def_acts(ax, df, def_df, col, bg_color, line_color):
     pitch.scatter(intc.x,intc.y,s=250,c='None',lw=2.5,edgecolor=col,marker='s',hatch='/////',ax=ax)
     pitch.scatter(br.x,br.y,s=250,c='None',lw=2.5,edgecolor=col,marker='o',hatch='/////',ax=ax)
     pitch.scatter(cl.x,cl.y,s=250,c='None',lw=2.5,edgecolor=col,marker='d',hatch='/////',ax=ax)
-    ax.text(5,73,f"Ent:{len(tk)} Int:{len(intc)} Rec:{len(br)} Desp:{len(cl)}",color=col,fontsize=12,ha='right')
+    ax.text(100,73,f"Ent:{len(tk)} Int:{len(intc)} Rec:{len(br)} Desp:{len(cl)}",color=col,fontsize=12,ha='right')
     ax.set_title(f"{def_df['shortName'].iloc[0]} Acciones Defensivas",color=col,fontsize=25,fontweight='bold')
 
 def home_gk_passmap(ax, df, teamName, col, bg_color, line_color):
@@ -539,13 +673,14 @@ def home_gk_passmap(ax, df, teamName, col, bg_color, line_color):
     gkdf = df[(df['teamName']==teamName)&(df['position']=='GK')]
     gkp = gkdf[gkdf['type']=='Pass']
     if gkp.empty: ax.set_title("Sin datos PT",color=col,fontsize=25,fontweight='bold'); return
-    gkn = get_short_name(gkdf['name'].iloc[0]) if 'name' in gkdf.columns else 'PT'
+    gkn = get_short_name(gkdf['name'].iloc[0]) if 'name' in gkdf.columns and not gkdf['name'].isna().all() else 'PT'
     for _,r in gkp.iterrows():
         c = col if r['outcomeType']=='Successful' else 'gray'
         pitch.lines(r['x'],r['y'],r['endX'],r['endY'],color=c,lw=3,comet=True,alpha=0.6,zorder=2,ax=ax)
         ax.scatter(r['endX'],r['endY'],s=30,color=bg_color if r['outcomeType']!='Successful' else c,edgecolor=c,zorder=3)
     ax.set_title(f'{gkn} Mapa de Pases Portero',color=col,fontsize=25,fontweight='bold')
-    ax.text(52.5,-3,f'Pases: {len(gkp)} | Ok: {len(gkp[gkp["outcomeType"]=="Successful"])}',color=line_color,fontsize=13,ha='center')
+    succ = len(gkp[gkp['outcomeType']=='Successful'])
+    ax.text(52.5,-3,f'Pases: {len(gkp)} | Ok: {succ}',color=line_color,fontsize=13,ha='center')
 
 def away_gk_passmap(ax, df, teamName, col, bg_color, line_color):
     pitch = Pitch(pitch_type='uefa', corner_arcs=True, pitch_color=bg_color, line_color=line_color, linewidth=2)
@@ -554,13 +689,14 @@ def away_gk_passmap(ax, df, teamName, col, bg_color, line_color):
     gkdf = df[(df['teamName']==teamName)&(df['position']=='GK')]
     gkp = gkdf[gkdf['type']=='Pass']
     if gkp.empty: ax.set_title("Sin datos PT",color=col,fontsize=25,fontweight='bold'); return
-    gkn = get_short_name(gkdf['name'].iloc[0]) if 'name' in gkdf.columns else 'PT'
+    gkn = get_short_name(gkdf['name'].iloc[0]) if 'name' in gkdf.columns and not gkdf['name'].isna().all() else 'PT'
     for _,r in gkp.iterrows():
         c = col if r['outcomeType']=='Successful' else 'gray'
         pitch.lines(r['x'],r['y'],r['endX'],r['endY'],color=c,lw=3,comet=True,alpha=0.6,zorder=2,ax=ax)
         ax.scatter(r['endX'],r['endY'],s=30,color=bg_color if r['outcomeType']!='Successful' else c,edgecolor=c,zorder=3)
     ax.set_title(f'{gkn} Mapa de Pases Portero',color=col,fontsize=25,fontweight='bold')
-    ax.text(52.5,71,f'Pases: {len(gkp)} | Ok: {len(gkp[gkp["outcomeType"]=="Successful"])}',color=line_color,fontsize=13,ha='center')
+    succ = len(gkp[gkp['outcomeType']=='Successful'])
+    ax.text(52.5,71,f'Pases: {len(gkp)} | Ok: {succ}',color=line_color,fontsize=13,ha='center')
 
 def passer_bar(ax, hp, ap, hcol, acol, bg_color, line_color):
     pf = pd.concat([hp,ap]).sort_values('total',ascending=False).head(10).sort_values('total',ascending=True)
@@ -568,8 +704,8 @@ def passer_bar(ax, hp, ap, hcol, acol, bg_color, line_color):
     n,pp,pc = pf['shortName'].tolist(),pf['Progressive Passes'].tolist(),pf['Progressive Carries'].tolist()
     ax.barh(n,pp,label='Pases Prog',color=hcol); ax.barh(n,pc,label='Cond Prog',color=acol,left=pp)
     for i,(p,c) in enumerate(zip(pp,pc)):
-        if p>0: ax.text(p/2,i,str(int(p)),ha='center',va='center',color=line_color,fontsize=11,fontweight='bold')
-        if c>0: ax.text(p+c/2,i,str(int(c)),ha='center',va='center',color=line_color,fontsize=11,fontweight='bold')
+        if p>0: ax.text(p/2,i,str(int(p)),ha='center',va='center',color='white',fontsize=11,fontweight='bold')
+        if c>0: ax.text(p+c/2,i,str(int(c)),ha='center',va='center',color='white',fontsize=11,fontweight='bold')
     ax.set_facecolor(bg_color); ax.tick_params(axis='x',colors=line_color,labelsize=12); ax.tick_params(axis='y',colors=line_color,labelsize=12)
     for s in ax.spines.values(): s.set_edgecolor(bg_color)
     ax.set_title("Top 10 progresores de balón",color=line_color,fontsize=25,fontweight='bold')
@@ -604,8 +740,8 @@ def generate_dashboard_1(df, players_df, hteamName, ateamName, hcol, acol, bg_co
     hpb,hal = get_passes_between_df(hteamName,passes_df,df,players_df)
     apb,aal = get_passes_between_df(ateamName,passes_df,df,players_df)
     da_df = get_defensive_action_df(df)
-    hdal = get_da_count_df(hteamName,da_df,players_df); hdal = hdal[hdal['position']!='GK']
-    adal = get_da_count_df(ateamName,da_df,players_df); adal = adal[adal['position']!='GK']
+    hdal = get_da_count_df(hteamName,da_df,players_df); hdal = hdal[hdal['position']!='GK'] if 'position' in hdal.columns else hdal
+    adal = get_da_count_df(ateamName,da_df,players_df); adal = adal[adal['position']!='GK'] if 'position' in adal.columns else adal
     pass_network_visualization(axs[0,0],hpb,hal,hcol,hteamName,hteamName,bg_color,line_color,passes_df)
     plot_shotmap(axs[0,1],df,hteamName,ateamName,hcol,acol,bg_color,line_color)
     pass_network_visualization(axs[0,2],apb,aal,acol,ateamName,hteamName,bg_color,line_color,passes_df)
@@ -638,12 +774,10 @@ def generate_dashboard_2(df, players_df, hteamName, ateamName, hcol, acol, bg_co
     Pass_end_zone(axs[2,0],df,hteamName,hcol,hteamName,bg_color,line_color)
     HighTO(axs[2,1],df,hteamName,ateamName,hcol,acol,bg_color,line_color)
     Pass_end_zone(axs[2,2],df,ateamName,acol,hteamName,bg_color,line_color)
-    for i,(t,c) in enumerate([(hteamName,hcol),(ateamName,acol)]):
-        ai = 0 if i==0 else 2
-        axs[3,ai].set_facecolor(bg_color); axs[3,ai].axis('off')
-        axs[3,ai].text(0.5,0.5,f"{t}\nZona Oportunidades creadas\n(Requiere datos adicionales)",color=c,fontsize=16,ha='center',va='center',transform=axs[3,ai].transAxes)
-    axs[3,1].set_facecolor(bg_color); axs[3,1].axis('off')
-    axs[3,1].text(0.5,0.5,"Zona de dominio equipo\n(Requiere cálculos territoriales)",color=line_color,fontsize=16,ha='center',va='center',transform=axs[3,1].transAxes)
+    # Fila 4: Chance creating zone y plot_congestion
+    Chance_creating_zone(axs[3,0],df,hteamName,hcol,hteamName,bg_color,line_color)
+    plot_congestion(axs[3,1],df,hteamName,ateamName,hcol,acol,bg_color,line_color)
+    Chance_creating_zone(axs[3,2],df,ateamName,acol,hteamName,bg_color,line_color)
     fig.text(0.5,0.98,f"{hteamName} {hg} - {ag} {ateamName}",color=line_color,fontsize=60,fontweight='bold',ha='center',va='top')
     fig.text(0.5,0.95,titulo.replace("Informe-1","Informe-2"),color=line_color,fontsize=28,ha='center',va='top')
     fig.text(0.5,0.93,f"{subtitulo} | Analista {analyst}",color=analyst_col,fontsize=22,ha='center',va='top')
